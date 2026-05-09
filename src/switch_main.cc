@@ -154,33 +154,6 @@ static bool send_to_host(
     return sr_write(host->conn, header, payload);
 }
 
-static void send_ack_to_host(
-    const std::shared_ptr<HostConn>& host,
-    const MsgHeader& src
-) {
-    MsgHeader ack{};
-    ack.magic = MAGIC;
-    ack.version = PROTOCOL_VERSION;
-    ack.type = MSG_ACK;
-    ack.header_len = sizeof(MsgHeader);
-    ack.payload_len = 0;
-    ack.run_id = src.run_id;
-    ack.microbatch_id = src.microbatch_id;
-    ack.token_id = src.token_id;
-    ack.src_rank = 0;
-    ack.dst_rank = src.src_rank;
-    ack.origin_rank = src.origin_rank;
-    ack.expert_bitmap = src.expert_bitmap;
-    ack.global_idx = src.global_idx;
-    ack.timestamp_ns = ns_timestamp();
-
-    if (!send_to_host(host, ack, nullptr)) {
-        std::cerr << "Switch failed to send ACK to host rank "
-                  << host->rank
-                  << std::endl;
-    }
-}
-
 static void broadcast_finish(SwitchState& state, uint64_t run_id) {
     auto hosts = snapshot_hosts(state);
 
@@ -398,6 +371,8 @@ static void handle_dispatch_token(
         if (!send_to_host(target, input_header, payload.data())) {
             std::cerr << "Switch failed to send EXPERT_INPUT token="
                       << header.token_id
+                      << " from "
+                      << header.src_rank
                       << " to expert rank "
                       << target->rank
                       << std::endl;
@@ -416,13 +391,14 @@ static void handle_dispatch_token(
         } else {
             std::cout << "Switch dispatched token="
                       << header.token_id
+                      << " from "
+                      << header.src_rank
                       << " to expert rank="
                       << target->rank
                       << std::endl;
         }
     }
 
-    send_ack_to_host(sender, header);
 }
 
 static void handle_combine_pull_req(
@@ -563,9 +539,11 @@ static void host_reader_loop(
 
                 state->running.store(false);
                 broadcast_finish(*state, header.run_id);
+
+                break;
             }
 
-            break;
+            continue;
         }
 
         std::cerr << "Switch ignored message type "

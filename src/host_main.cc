@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <deque>
 
 struct CombineKey {
     uint64_t run_id;
@@ -46,6 +47,11 @@ struct CombineWaitState {
     std::vector<char> payload;
 };
 
+struct ExpertTask {
+    MsgHeader header{};
+    std::vector<char> payload;
+};
+
 struct HostState {
     int rank = -1;
     SrConn* conn = nullptr;
@@ -59,6 +65,10 @@ struct HostState {
 
     std::map<CombineKey, bool> dispatch_acks;
     std::map<CombineKey, CombineWaitState> combine_states;
+
+    std::mutex expert_mutex;
+    std::condition_variable expert_cv;
+    std::deque<ExpertTask> expert_queue;
 };
 
 static CombineKey make_key(const MsgHeader& header) {
@@ -80,29 +90,22 @@ static bool send_to_switch(
     return sr_write(state.conn, header, payload);
 }
 
-static void send_expert_ack(
+static void enqueue_expert_input(
     HostState& state,
-    const MsgHeader& input_header
+    const MsgHeader& header,
+    const std::vector<char>& payload
 ) {
-    MsgHeader ack{};
-    ack.magic = MAGIC;
-    ack.version = PROTOCOL_VERSION;
-    ack.type = MSG_ACK;
-    ack.header_len = sizeof(MsgHeader);
-    ack.payload_len = 0;
+    {
+        std::lock_guard<std::mutex> lock(state.expert_mutex);
 
-    ack.run_id = input_header.run_id;
-    ack.microbatch_id = input_header.microbatch_id;
-    ack.token_id = input_header.token_id;
+        ExpertTask task;
+        task.header = header;
+        task.payload = payload;
 
-    ack.src_rank = static_cast<uint32_t>(state.rank);
-    ack.dst_rank = 0;
-    ack.origin_rank = input_header.origin_rank;
-    ack.expert_bitmap = input_header.expert_bitmap;
-    ack.global_idx = input_header.global_idx;
-    ack.timestamp_ns = ns_timestamp();
+        state.expert_queue.push_back(std::move(task));
+    }
 
-    send_to_switch(state, ack, nullptr);
+    state.expert_cv.notify_one();
 }
 
 static void handle_expert_input(
@@ -116,8 +119,6 @@ static void handle_expert_input(
               << " origin_rank="
               << input_header.origin_rank
               << std::endl;
-
-    send_expert_ack(state, input_header);
 
     std::vector<char> result(payload.size());
 
@@ -153,16 +154,49 @@ static void handle_expert_input(
         std::cerr << "Host rank=" << state.rank
                   << " failed to send EXPERT_RESULT token="
                   << input_header.token_id
+                  << " from "
+                  << input_header.origin_rank
                   << std::endl;
 
         state.running.store(false);
         state.cv.notify_all();
+        state.expert_cv.notify_all();
         return;
     }
 
     std::cout << "Host rank=" << state.rank
               << " sent EXPERT_RESULT token="
               << input_header.token_id
+              << " from "
+              << input_header.origin_rank
+              << std::endl;
+}
+
+static void expert_worker_loop(HostState* state) {
+    while (true) {
+        ExpertTask task;
+
+        {
+            std::unique_lock<std::mutex> lock(state->expert_mutex);
+
+            state->expert_cv.wait(lock, [&]() {
+                return !state->running.load() ||
+                       !state->expert_queue.empty();
+            });
+
+            if (!state->running.load() && state->expert_queue.empty()) {
+                break;
+            }
+
+            task = std::move(state->expert_queue.front());
+            state->expert_queue.pop_front();
+        }
+
+        handle_expert_input(*state, task.header, task.payload);
+    }
+
+    std::cout << "Host rank=" << state->rank
+              << " expert worker exited"
               << std::endl;
 }
 
@@ -180,6 +214,7 @@ static void reader_loop(HostState* state) {
 
             state->running.store(false);
             state->cv.notify_all();
+            state->expert_cv.notify_all();
             break;
         }
 
@@ -202,8 +237,17 @@ static void reader_loop(HostState* state) {
         }
 
         if (header.type == MSG_EXPERT_INPUT) {
-            handle_expert_input(*state, header, payload);
-            continue;
+            if (header.type == MSG_EXPERT_INPUT) {
+                std::cout << "Host rank=" << state->rank
+                    << " received EXPERT_INPUT token="
+                    << header.token_id
+                    << " origin_rank="
+                    << header.origin_rank
+                    << std::endl;
+
+                enqueue_expert_input(*state, header, payload);
+                continue;
+            }
         }
 
         if (header.type == MSG_COMBINE_RESULT) {
@@ -255,6 +299,7 @@ static void reader_loop(HostState* state) {
 
             state->running.store(false);
             state->cv.notify_all();
+            state->expert_cv.notify_all();
             break;
         }
 
@@ -440,6 +485,7 @@ int main(int argc, char* argv[]) {
               << std::endl;
 
     std::thread reader_thread(reader_loop, &state);
+    std::thread expert_thread(expert_worker_loop, &state);
 
     auto tokens = make_workload(
         hello.run_id,
@@ -607,15 +653,23 @@ int main(int argc, char* argv[]) {
         finish.origin_rank = static_cast<uint32_t>(rank);
         finish.timestamp_ns = ns_timestamp();
 
+        std::cerr << "Host rank=" << rank
+                      << " finished sending raw tokens"
+                      << std::endl;
+
         send_to_switch(state, finish, nullptr);
     }
 
-    /*
-     * 当前 switch 版本收到任意 host 的 FINISH 会广播 FINISH。
-     * reader_thread 收到 MSG_FINISH 后会退出。
-     */
     if (reader_thread.joinable()) {
         reader_thread.join();
+    }
+
+    state.running.store(false);
+    state.cv.notify_all();
+    state.expert_cv.notify_all();
+
+    if (expert_thread.joinable()) {
+        expert_thread.join();
     }
 
     sr_close(state.conn);
