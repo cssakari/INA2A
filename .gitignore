@@ -1,0 +1,9 @@
+/bin/
+/*.o
+*.exe
+
+*.swp
+*.log
+
+.idea/
+.vscode/
