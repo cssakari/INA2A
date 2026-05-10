@@ -288,6 +288,8 @@ static void handle_expert_result(
               << header.token_id
               << " from expert rank="
               << expert_rank
+              << ", original rank="
+              << slot.origin_rank
               << ", pending_bitmap="
               << slot.pending_bitmap
               << std::endl;
