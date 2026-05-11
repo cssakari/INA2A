@@ -385,43 +385,36 @@ static bool send_to_switch(
     return sr_write(state.conn, header, payload);
 }
 
-static void compute_loop(HostState* state) {
+static void control_loop(HostState* state) {
     /*
-     * 初始只允许window_size个raw token进入attention。
-     * window_size=1时，只会加入第一个raw token。
+     * 初始只允许 window_size 个 raw token 进入 attention。
      */
     try_admit_raw_tokens_to_compute_queue(*state);
 
     while (state->running.load()) {
-        /*
-         * 1. 处理计算任务：
-         *    - LOCAL_ATTENTION：本host自己的token生成/attention
-         *    - EXPERT_MLP：别人dispatch过来的expert计算
-         */
-        ComputeTask task;
-
-        if (state->compute_queue.try_pop_for(
-                task,
-                std::chrono::milliseconds(1)
-            )) {
-            if (task.type == ComputeTaskType::LOCAL_ATTENTION) {
-                process_local_attention(*state, task.token_index);
-            } else if (task.type == ComputeTaskType::EXPERT_MLP) {
-                process_expert_mlp(*state, task.header, task.payload);
-            }
-
-            continue;
-        }
-
-        /*
-         * 2. 对已经dispatch ACK，但尚未combine完成的token，周期性发pull。
-         */
-        auto now = std::chrono::steady_clock::now();
         std::vector<int> need_pull;
+        bool window_moved = false;
+        bool should_send_finish = false;
+        MsgHeader finish{};
 
         {
-            std::lock_guard<std::mutex> lock(state->state_mutex);
+            std::unique_lock<std::mutex> lock(state->state_mutex);
 
+            /*
+             * 等 read_loop / compute_loop 通知，或者周期性醒来检查 pull retry。
+             * 这里用 1ms 是简单版本；后面可以改成 wait_until(next_pull_time)。
+             */
+            state->cv.wait_for(lock, std::chrono::milliseconds(1));
+
+            if (!state->running.load()) {
+                break;
+            }
+
+            auto now = std::chrono::steady_clock::now();
+
+            /*
+             * 1. 对已经 dispatch ACK，但尚未 combine 完成的 token，周期性发 pull。
+             */
             for (int i = state->window_base;
                  i < state->next_to_admit;
                  ++i) {
@@ -459,22 +452,10 @@ static void compute_loop(HostState* state) {
                 st.pull_inflight = true;
                 need_pull.push_back(i);
             }
-        }
 
-        for (int idx : need_pull) {
-            enqueue_combine_pull(*state, idx);
-        }
-
-        /*
-         * 3. 滑动窗口：
-         *    只有window_base对应token收到COMBINE_RESULT，
-         *    才能释放窗口槽位。
-         */
-        bool window_moved = false;
-
-        {
-            std::lock_guard<std::mutex> lock(state->state_mutex);
-
+            /*
+             * 2. 滑动窗口。
+             */
             while (state->window_base < state->num_tokens) {
                 int idx = state->window_base;
 
@@ -487,31 +468,24 @@ static void compute_loop(HostState* state) {
                     break;
                 }
 
-                state->logger.logf(Logger::INFO, "Host rank=%d sliding window releases token_index=%d", state->rank, idx);
+                state->logger.logf(
+                    Logger::INFO,
+                    "Host rank=%d sliding window releases token_index=%d",
+                    state->rank,
+                    idx
+                );
 
                 state->window_base++;
                 state->received_combines++;
                 window_moved = true;
             }
-        }
 
-        /*
-         * 4. 只要窗口释放了槽位，新的raw token才进入compute_queue。
-         */
-        if (window_moved) {
-            try_admit_raw_tokens_to_compute_queue(*state);
-        }
-
-        /*
-         * 5. 本host作为sender完成全部token后，发送FINISH。
-         *    注意不要立刻running=false，因为还要继续作为expert处理别人发来的token。
-         */
-        {
-            std::lock_guard<std::mutex> lock(state->state_mutex);
-
+            /*
+             * 3. 判断本 host 的 sender 侧是否完成。
+             * 注意：这里只构造 FINISH，不要持锁 enqueue_send。
+             */
             if (!state->finish_enqueued &&
                 state->received_combines >= state->num_tokens) {
-                MsgHeader finish{};
                 finish.magic = MAGIC;
                 finish.version = PROTOCOL_VERSION;
                 finish.type = MSG_FINISH;
@@ -526,16 +500,71 @@ static void compute_loop(HostState* state) {
                 finish.origin_rank = static_cast<uint32_t>(state->rank);
                 finish.timestamp_ns = ns_timestamp();
 
-                enqueue_send(*state, finish, nullptr);
-
                 state->finish_enqueued = true;
+                should_send_finish = true;
 
-                state->logger.logf(Logger::INFO, "Host rank=%d local sender finished all tokens", state->rank);
+                state->logger.logf(
+                    Logger::INFO,
+                    "Host rank=%d local sender finished all tokens",
+                    state->rank
+                );
             }
+        }
+
+        /*
+         * 4. 发送 pull。
+         * 不要在 state_mutex 里 enqueue_send，避免锁链路变长。
+         */
+        for (int idx : need_pull) {
+            enqueue_combine_pull(*state, idx);
+        }
+
+        /*
+         * 5. 窗口释放后 admit 新 token。
+         */
+        if (window_moved) {
+            try_admit_raw_tokens_to_compute_queue(*state);
+        }
+
+        /*
+         * 6. 发送 FINISH。
+         */
+        if (should_send_finish) {
+            enqueue_send(*state, finish, nullptr);
         }
     }
 
-    state->logger.logf(Logger::INFO, "Host rank=%d compute_loop exited", state->rank);
+    state->logger.logf(
+        Logger::INFO,
+        "Host rank=%d control_loop exited",
+        state->rank
+    );
+}
+
+static void compute_loop(HostState* state) {
+    while (state->running.load()) {
+        ComputeTask task;
+
+        if (!state->compute_queue.pop(task)) {
+            break;
+        }
+
+        if (!state->running.load()) {
+            break;
+        }
+
+        if (task.type == ComputeTaskType::LOCAL_ATTENTION) {
+            process_local_attention(*state, task.token_index);
+        } else if (task.type == ComputeTaskType::EXPERT_MLP) {
+            process_expert_mlp(*state, task.header, task.payload);
+        }
+    }
+
+    state->logger.logf(
+        Logger::INFO,
+        "Host rank=%d compute_loop exited",
+        state->rank
+    );
 }
 
 static void send_loop(HostState* state) {
@@ -790,14 +819,14 @@ int main(int argc, char* argv[]) {
         state.token_states.resize(state.num_tokens);
     }
 
-/*
- * 从这里开始，main不再直接发送token。
- * raw token必须先被滑动窗口放入compute_queue，
- * attention完成后才会进入send_queue。
- */
     std::thread sender_thread(send_loop, &state);
     std::thread reader_thread(read_loop, &state);
     std::thread compute_thread(compute_loop, &state);
+    std::thread control_thread(control_loop, &state);
+
+    if (control_thread.joinable()) {
+        control_thread.join();
+    }
 
     if (compute_thread.joinable()) {
         compute_thread.join();
@@ -807,50 +836,6 @@ int main(int argc, char* argv[]) {
     state.cv.notify_all();
     state.send_queue.close();
     state.compute_queue.close();
-
-    if (reader_thread.joinable()) {
-        reader_thread.join();
-    }
-
-    if (sender_thread.joinable()) {
-        sender_thread.join();
-    }
-
-std::cout << "Host rank=" << rank
-          << " exited, received_combines="
-          << state.received_combines
-          << "/"
-          << state.num_tokens
-          << std::endl;
-
-    if (state.running.load()) {
-        MsgHeader finish{};
-        finish.magic = MAGIC;
-        finish.version = PROTOCOL_VERSION;
-        finish.type = MSG_FINISH;
-        finish.header_len = sizeof(MsgHeader);
-        finish.payload_len = 0;
-        finish.run_id = hello.run_id;
-        finish.src_rank = static_cast<uint32_t>(rank);
-        finish.dst_rank = 0;
-        finish.origin_rank = static_cast<uint32_t>(rank);
-        finish.timestamp_ns = ns_timestamp();
-
-        std::cerr << "Host rank=" << rank
-                      << " finished sending raw tokens"
-                      << std::endl;
-
-        send_to_switch(state, finish, nullptr);
-    }
-
-    if (compute_thread.joinable()) {
-        compute_thread.join();
-    }
-
-    state.running.store(false);
-    state.cv.notify_all();
-    state.compute_queue.close();
-    state.send_queue.close();
 
     if (reader_thread.joinable()) {
         reader_thread.join();
@@ -861,12 +846,13 @@ std::cout << "Host rank=" << rank
     }
 
     sr_close(state.conn);
-
+    
     std::cout << "Host rank=" << rank
-              << " completed, received "
-              << state.received_combines
-              << " combine results."
-              << std::endl;
+          << " exited, received_combines="
+          << state.received_combines
+          << "/"
+          << state.num_tokens
+          << std::endl;
 
     return 0;
 }
