@@ -38,7 +38,7 @@ TokenDesc make_token(uint64_t run_id, uint64_t mb, uint64_t token_id, int src_ra
     t.dst_rank = 0;
     t.origin_rank = src_rank;
     t.global_idx = token_id;
-    t.payload_len = 2048;
+    t.payload_len = 128 * 1024;
     t.expert_bitmap = choose_topk_bitmap(num_hosts, topk);
     return t;
 }
