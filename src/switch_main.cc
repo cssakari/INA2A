@@ -216,6 +216,17 @@ static bool mark_host_finished(
     return static_cast<int>(state.finished_hosts.size()) >= state.num_hosts;
 }
 
+static void close_all_host_connections(SwitchState& state) {
+    auto hosts = snapshot_hosts(state);
+
+    for (auto& host : hosts) {
+        if (host && host->conn) {
+            sr_close(host->conn);
+            host->conn = nullptr;
+        }
+    }
+}
+
 static void handle_expert_result(
     SwitchState& state,
     const std::shared_ptr<HostConn>& host,
@@ -471,6 +482,10 @@ static void host_reader_loop(
         MsgHeader header{};
         std::vector<char> payload;
 
+        if (!host->conn) {
+            break;
+        }
+
         if (!sr_read(host->conn, header, payload)) {
             if (state->running.load()) {
                 state->logger.logf(Logger::ERROR, "Switch receive failed from host rank %d", host->rank);
@@ -507,8 +522,9 @@ static void host_reader_loop(
             if (all_finished) {
                 state->logger.logf(Logger::INFO, "Switch received FINISH from all hosts, broadcasting FINISH.");
 
-                state->running.store(false);
                 broadcast_finish(*state, header.run_id);
+                state->running.store(false);
+                close_all_host_connections(*state);
 
                 break;
             }
@@ -675,12 +691,15 @@ int main(int argc, char* argv[]) {
     state.running.store(false);
 
     for (auto& host : accepted_hosts) {
-        sr_close(host->conn);
+        if (host && host->conn) {
+            sr_close(host->conn);
+            host->conn = nullptr;
+        }
     }
 
     sr_close_listener(listener);
 
-    std::cout << "Switch closed." << std::endl;
+    std::cout << "Switch closed normally." << std::endl;
 
     return 0;
 }
