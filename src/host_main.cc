@@ -1,6 +1,7 @@
 #include "transport_softroce.h"
 #include "workload.h"
 #include "protocol.h"
+#include "log.h"
 
 #include <algorithm>
 #include <atomic>
@@ -163,10 +164,9 @@ struct HostState {
     int received_combines = 0;
     bool finish_enqueued = false;
 
-    /*
-     * token index -> runtime
-     */
     std::map<int, TokenRuntime> tokens;
+
+    Logger logger{"host.log"};
 };
 
 static void enqueue_send(
@@ -226,12 +226,12 @@ static void process_expert_mlp(
     const MsgHeader& input_header,
     const std::vector<char>& payload
 ) {
-    std::cout << "Host rank=" << state.rank
-              << " compute EXPERT_INPUT token="
-              << input_header.token_id
-              << " origin_rank="
-              << input_header.origin_rank
-              << std::endl;
+
+    state.logger.logf(Logger::INFO, "Host rank=%d compute EXPERT_INPUT token=%lu origin_rank=%u",
+        state.rank,
+        input_header.token_id,
+        input_header.origin_rank
+    );
 
     std::vector<char> result(payload.size());
 
@@ -261,12 +261,11 @@ static void process_expert_mlp(
 
     enqueue_send(state, response, result.data());
 
-    std::cout << "Host rank=" << state.rank
-              << " enqueue EXPERT_RESULT token="
-              << input_header.token_id
-              << " origin_rank="
-              << input_header.origin_rank
-              << std::endl;
+    state.logger.logf(Logger::INFO, "Host rank=%d enqueue EXPERT_RESULT token=%lu origin_rank=%u",
+        state.rank,
+        input_header.token_id,
+        input_header.origin_rank
+    );
 }
 
 static void try_admit_raw_tokens_to_compute_queue(HostState& state) {
@@ -297,10 +296,10 @@ static void try_admit_raw_tokens_to_compute_queue(HostState& state) {
 
         state.compute_queue.push(std::move(task));
 
-        std::cout << "Host rank=" << state.rank
-                  << " admit raw token to compute_queue, token_index="
-                  << idx
-                  << std::endl;
+        state.logger.logf(Logger::INFO, "Host rank=%d admit raw token to compute_queue, token_index=%d",
+            state.rank,
+            idx
+        );
     }
 }
 
@@ -363,14 +362,12 @@ static void process_local_attention(
 
     enqueue_send(state, dispatch, payload.data());
 
-    std::cout << "Host rank=" << state.rank
-              << " attention done, enqueue DISPATCH_TOKEN token="
-              << token.token_id
-              << " token_index="
-              << token_index
-              << " expert_bitmap="
-              << token.expert_bitmap
-              << std::endl;
+    state.logger.logf(Logger::INFO, "Host rank=%d attention done, enqueue DISPATCH_TOKEN token=%lu token_index=%d expert_bitmap=%u",
+        state.rank,
+        token.token_id,
+        token_index,
+        token.expert_bitmap
+    );
 
     state.cv.notify_all();
 }
@@ -486,10 +483,7 @@ static void compute_loop(HostState* state) {
                     break;
                 }
 
-                std::cout << "Host rank=" << state->rank
-                          << " sliding window releases token_index="
-                          << idx
-                          << std::endl;
+                state->logger.logf(Logger::INFO, "Host rank=%d sliding window releases token_index=%d", state->rank, idx);
 
                 state->window_base++;
                 state->received_combines++;
@@ -532,16 +526,12 @@ static void compute_loop(HostState* state) {
 
                 state->finish_enqueued = true;
 
-                std::cout << "Host rank=" << state->rank
-                          << " local sender finished all tokens"
-                          << std::endl;
+                state->logger.logf(Logger::INFO, "Host rank=%d local sender finished all tokens", state->rank);
             }
         }
     }
 
-    std::cout << "Host rank=" << state->rank
-              << " compute_loop exited"
-              << std::endl;
+    state->logger.logf(Logger::INFO, "Host rank=%d compute_loop exited", state->rank);
 }
 
 static void send_loop(HostState* state) {
@@ -559,12 +549,8 @@ static void send_loop(HostState* state) {
         }
 
         if (!send_to_switch(*state, msg.header, payload_ptr)) {
-            std::cerr << "Host rank=" << state->rank
-                      << " send_loop failed, msg_type="
-                      << msg.header.type
-                      << " token="
-                      << msg.header.token_id
-                      << std::endl;
+
+            state->logger.logf(Logger::ERROR, "Host rank=%d send_loop failed, msg_type=%d token=%lu", state->rank, msg.header.type, msg.header.token_id);
 
             state->running.store(false);
             state->cv.notify_all();
@@ -574,9 +560,7 @@ static void send_loop(HostState* state) {
         }
     }
 
-    std::cout << "Host rank=" << state->rank
-              << " send_loop exited"
-              << std::endl;
+    state->logger.logf(Logger::INFO, "Host rank=%d send_loop exited", state->rank);
 }
 
 static void read_loop(HostState* state) {
@@ -585,9 +569,8 @@ static void read_loop(HostState* state) {
         std::vector<char> payload;
 
         if (!sr_read(state->conn, header, payload)) {
-            std::cerr << "Host rank=" << state->rank
-                      << " read_loop failed"
-                      << std::endl;
+            
+            state->logger.logf(Logger::ERROR, "Host rank=%d read_loop failed", state->rank);
 
             state->running.store(false);
             state->cv.notify_all();
@@ -655,12 +638,7 @@ static void read_loop(HostState* state) {
                     st.pull_inflight = false;
                     st.combine_payload = std::move(payload);
 
-                    std::cout << "Host rank=" << state->rank
-                              << " received COMBINE_RESULT token="
-                              << header.token_id
-                              << " token_index="
-                              << idx
-                              << std::endl;
+                    state->logger.logf(Logger::INFO, "Host rank=%d received COMBINE_RESULT token=%lu token_index=%d", state->rank, header.token_id, idx);
                 }
             }
 
@@ -669,9 +647,8 @@ static void read_loop(HostState* state) {
         }
 
         if (header.type == MSG_FINISH) {
-            std::cout << "Host rank=" << state->rank
-                      << " received FINISH"
-                      << std::endl;
+
+            state->logger.logf(Logger::INFO, "Host rank=%d received FINISH", state->rank);
 
             state->running.store(false);
             state->cv.notify_all();
@@ -680,10 +657,7 @@ static void read_loop(HostState* state) {
             break;
         }
 
-        std::cerr << "Host rank=" << state->rank
-                  << " ignored msg_type="
-                  << header.type
-                  << std::endl;
+        state->logger.logf(Logger::ERROR, "Host rank=%d ignored msg_type=%d", state->rank, header.type);
     }
 }
 
@@ -786,57 +760,57 @@ int main(int argc, char* argv[]) {
               << std::endl;
 
     auto tokens = make_workload(
-    hello.run_id,
-    num_tokens,
-    rank,
-    num_hosts,
-    topk
-);
+        hello.run_id,
+        num_tokens,
+        rank,
+        num_hosts,
+        topk
+    );
 
-{
-    std::lock_guard<std::mutex> lock(state.state_mutex);
+    {
+        std::lock_guard<std::mutex> lock(state.state_mutex);
 
-    state.rank = rank;
+        state.rank = rank;
 
-    state.workload = std::move(tokens);
-    state.num_tokens = static_cast<int>(state.workload.size());
+        state.workload = std::move(tokens);
+        state.num_tokens = static_cast<int>(state.workload.size());
 
-    state.window_size = window_size;
+        state.window_size = window_size;
 
-    state.window_base = 0;
-    state.next_to_admit = 0;
-    state.received_combines = 0;
-    state.finish_enqueued = false;
+        state.window_base = 0;
+        state.next_to_admit = 0;
+        state.received_combines = 0;
+        state.finish_enqueued = false;
 
-    state.token_states.clear();
-    state.token_states.resize(state.num_tokens);
-}
+        state.token_states.clear();
+        state.token_states.resize(state.num_tokens);
+    }
 
 /*
  * 从这里开始，main不再直接发送token。
  * raw token必须先被滑动窗口放入compute_queue，
  * attention完成后才会进入send_queue。
  */
-std::thread sender_thread(send_loop, &state);
-std::thread reader_thread(read_loop, &state);
-std::thread compute_thread(compute_loop, &state);
+    std::thread sender_thread(send_loop, &state);
+    std::thread reader_thread(read_loop, &state);
+    std::thread compute_thread(compute_loop, &state);
 
-if (compute_thread.joinable()) {
-    compute_thread.join();
-}
+    if (compute_thread.joinable()) {
+        compute_thread.join();
+    }
 
-state.running.store(false);
-state.cv.notify_all();
-state.send_queue.close();
-state.compute_queue.close();
+    state.running.store(false);
+    state.cv.notify_all();
+    state.send_queue.close();
+    state.compute_queue.close();
 
-if (reader_thread.joinable()) {
-    reader_thread.join();
-}
+    if (reader_thread.joinable()) {
+        reader_thread.join();
+    }
 
-if (sender_thread.joinable()) {
-    sender_thread.join();
-}
+    if (sender_thread.joinable()) {
+        sender_thread.join();
+    }
 
 std::cout << "Host rank=" << rank
           << " exited, received_combines="

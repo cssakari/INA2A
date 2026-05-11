@@ -1,5 +1,6 @@
 #include "transport_softroce.h"
 #include "protocol.h"
+#include "log.h"
 
 #include <algorithm>
 #include <atomic>
@@ -77,6 +78,8 @@ struct SwitchState {
     std::mutex finish_mutex;
 
     std::atomic<bool> running{true};
+
+    Logger logger{"switch.log"};
 };
 
 static CombineKey make_key(const MsgHeader& header) {
@@ -208,13 +211,7 @@ static bool mark_host_finished(
 
     state.finished_hosts.insert(rank);
 
-    std::cout << "Switch marked host rank "
-              << rank
-              << " as finished. finished="
-              << state.finished_hosts.size()
-              << "/"
-              << state.num_hosts
-              << std::endl;
+    state.logger.logf(Logger::INFO, "Switch marked host rank %d as finished. finished=%u/%u", rank, static_cast<uint32_t>(state.finished_hosts.size()), static_cast<uint32_t>(state.num_hosts));
 
     return static_cast<int>(state.finished_hosts.size()) >= state.num_hosts;
 }
@@ -232,44 +229,30 @@ static void handle_expert_result(
     auto it_slot = state.combine_queue.find(key);
 
     if (it_slot == state.combine_queue.end()) {
-        std::cerr << "Switch received EXPERT_RESULT for unknown token "
-                  << key_to_string(key)
-                  << " from rank "
-                  << host->rank
-                  << std::endl;
+
+        state.logger.logf(Logger::ERROR, "Switch received EXPERT_RESULT for unknown token %s from rank %d", key_to_string(key).c_str(), host->rank);
         return;
     }
 
     QueueSlot& slot = it_slot->second;
 
     if (payload.size() != slot.payload_len) {
-        std::cerr << "Switch received size mismatch from rank "
-                  << host->rank
-                  << ", expected "
-                  << slot.payload_len
-                  << ", got "
-                  << payload.size()
-                  << std::endl;
+
+        state.logger.logf(Logger::ERROR, "Switch received size mismatch from rank %d, expected %u, got %zu", host->rank, slot.payload_len, payload.size());
         return;
     }
 
     uint32_t expert_rank = header.src_rank;
 
     if (expert_rank >= 64) {
-        std::cerr << "Switch received invalid expert rank "
-                  << expert_rank
-                  << std::endl;
+        state.logger.logf(Logger::ERROR, "Switch received invalid expert rank %d", expert_rank);
         return;
     }
 
     uint64_t expert_bit = 1ull << expert_rank;
 
     if ((slot.pending_bitmap & expert_bit) == 0) {
-        std::cerr << "Switch received duplicate or unexpected EXPERT_RESULT from rank "
-                  << expert_rank
-                  << " for token "
-                  << key_to_string(key)
-                  << std::endl;
+        state.logger.logf(Logger::ERROR, "Switch received duplicate or unexpected EXPERT_RESULT from rank %d for token %s", expert_rank, key_to_string(key).c_str());
         return;
     }
 
@@ -284,23 +267,12 @@ static void handle_expert_result(
 
     slot.pending_bitmap &= ~expert_bit;
 
-    std::cout << "Switch aggregated EXPERT_RESULT token="
-              << header.token_id
-              << " from expert rank="
-              << expert_rank
-              << ", original rank="
-              << slot.origin_rank
-              << ", pending_bitmap="
-              << slot.pending_bitmap
-              << std::endl;
+    state.logger.logf(Logger::INFO, "Switch aggregated EXPERT_RESULT token=%u from expert rank=%d, original rank=%d, pending_bitmap=%lu", header.token_id, expert_rank, slot.origin_rank, slot.pending_bitmap);
 
     if (slot.pending_bitmap == 0) {
         slot.ready = true;
 
-        std::cout << "Switch token "
-                  << key_to_string(key)
-                  << " fully aggregated."
-                  << std::endl;
+        state.logger.logf(Logger::INFO, "Switch token %s fully aggregated.", key_to_string(key).c_str());
     }
 }
 
@@ -311,13 +283,12 @@ static void handle_dispatch_token(
     const std::vector<char>& payload
 ) {
     if (payload.size() != header.payload_len) {
-        std::cerr << "Switch received DISPATCH_TOKEN payload size mismatch from rank "
-                  << sender->rank
-                  << ", header payload_len="
-                  << header.payload_len
-                  << ", actual="
-                  << payload.size()
-                  << std::endl;
+
+        state.logger.logf(Logger::ERROR, "Switch received DISPATCH_TOKEN payload size mismatch from rank %d, header payload_len=%u, actual=%zu",
+            sender->rank,
+            header.payload_len,
+            payload.size()
+        );
         return;
     }
 
@@ -325,13 +296,11 @@ static void handle_dispatch_token(
 
     auto selected_experts = decode_expert_ids(header.expert_bitmap, state.num_experts);
 
-    std::cout << "Switch received DISPATCH_TOKEN token="
-              << header.token_id
-              << " from sender rank="
-              << sender->rank
-              << " selected_experts="
-              << selected_experts.size()
-              << std::endl;
+    state.logger.logf(Logger::INFO, "Switch received DISPATCH_TOKEN token=%u from sender rank=%d, selected_experts=%zu",
+        header.token_id,
+        sender->rank,
+        selected_experts.size()
+    );
 
     std::vector<std::shared_ptr<HostConn>> targets;
     uint64_t expected_bitmap = 0;
@@ -340,10 +309,7 @@ static void handle_dispatch_token(
         auto target = find_host(state, static_cast<int>(expert_rank));
 
         if (!target) {
-            std::cerr << "Switch has no connected host for expert rank "
-                      << expert_rank
-                      << ", this expert will be skipped."
-                      << std::endl;
+            state.logger.logf(Logger::ERROR, "Switch has no connected host for expert rank %d, this expert will be skipped.", expert_rank);
             continue;
         }
 
@@ -355,9 +321,7 @@ static void handle_dispatch_token(
         std::lock_guard<std::mutex> lock(state.queue_mutex);
 
         if (state.combine_queue.count(key)) {
-            std::cerr << "Switch overwriting existing combine slot for token "
-                      << key_to_string(key)
-                      << std::endl;
+            state.logger.logf(Logger::INFO, "Switch overwriting existing combine slot for token %s", key_to_string(key).c_str());
         }
 
         QueueSlot slot{};
@@ -398,13 +362,7 @@ static void handle_dispatch_token(
         input_header.timestamp_ns = ns_timestamp();
 
         if (!send_to_host(target, input_header, payload.data())) {
-            std::cerr << "Switch failed to send EXPERT_INPUT token="
-                      << header.token_id
-                      << " from "
-                      << header.src_rank
-                      << " to expert rank "
-                      << target->rank
-                      << std::endl;
+            state.logger.logf(Logger::ERROR, "Switch failed to send EXPERT_INPUT token=%u from rank=%d to expert rank=%d", header.token_id, header.src_rank, target->rank);
 
             std::lock_guard<std::mutex> lock(state.queue_mutex);
 
@@ -418,13 +376,7 @@ static void handle_dispatch_token(
                 }
             }
         } else {
-            std::cout << "Switch dispatched token="
-                      << header.token_id
-                      << " from "
-                      << header.src_rank
-                      << " to expert rank="
-                      << target->rank
-                      << std::endl;
+            state.logger.logf(Logger::INFO, "Switch dispatched token=%u from rank=%d to expert rank=%d", header.token_id, header.src_rank, target->rank);
         }
     }
     
@@ -481,9 +433,7 @@ static void handle_combine_pull_req(
         response.timestamp_ns = ns_timestamp();
 
         if (!send_to_host(sender, response, result_data.data())) {
-            std::cerr << "Switch failed to send COMBINE_RESULT to rank "
-                      << sender->rank
-                      << std::endl;
+            state.logger.logf(Logger::ERROR, "Switch failed to send COMBINE_RESULT to rank %d", sender->rank);
         }
 
         return;
@@ -505,15 +455,11 @@ static void handle_combine_pull_req(
     not_ready.timestamp_ns = ns_timestamp();
 
     if (!exists) {
-        std::cerr << "Switch got COMBINE_PULL_REQ but slot does not exist for token "
-                  << key_to_string(key)
-                  << std::endl;
+        state.logger.logf(Logger::ERROR, "Switch got COMBINE_PULL_REQ but slot does not exist for token %s", key_to_string(key).c_str());
     }
 
     if (!send_to_host(sender, not_ready, nullptr)) {
-        std::cerr << "Switch failed to send MSG_NOT_READY to rank "
-                  << sender->rank
-                  << std::endl;
+        state.logger.logf(Logger::ERROR, "Switch failed to send MSG_NOT_READY to rank %d", sender->rank);
     }
 }
 
@@ -527,9 +473,7 @@ static void host_reader_loop(
 
         if (!sr_read(host->conn, header, payload)) {
             if (state->running.load()) {
-                std::cerr << "Switch receive failed from host rank "
-                          << host->rank
-                          << std::endl;
+                state->logger.logf(Logger::ERROR, "Switch receive failed from host rank %d", host->rank);
             }
             break;
         }
@@ -550,22 +494,18 @@ static void host_reader_loop(
         }
 
         if (header.type == MSG_ACK) {
-            std::cout << "Switch received ACK from host rank "
-                      << host->rank
-                      << std::endl;
+            state->logger.logf(Logger::INFO, "Switch received ACK from host rank %d", host->rank);
             continue;
         }
 
         if (header.type == MSG_FINISH) {
-            std::cout << "Switch received FINISH from host rank "
-              << host->rank
-              << std::endl;
+
+            state->logger.logf(Logger::INFO, "Switch received FINISH from host rank %d", host->rank);
 
             bool all_finished = mark_host_finished(*state, host->rank);
 
             if (all_finished) {
-                std::cout << "Switch received FINISH from all hosts, broadcasting FINISH."
-                  << std::endl;
+                state->logger.logf(Logger::INFO, "Switch received FINISH from all hosts, broadcasting FINISH.");
 
                 state->running.store(false);
                 broadcast_finish(*state, header.run_id);
@@ -576,16 +516,10 @@ static void host_reader_loop(
             continue;
         }
 
-        std::cerr << "Switch ignored message type "
-                  << header.type
-                  << " from host rank "
-                  << host->rank
-                  << std::endl;
+        state->logger.logf(Logger::ERROR, "Switch ignored message type %d from host rank %d", header.type, host->rank);
     }
 
-    std::cout << "Switch reader loop exited for host rank "
-              << host->rank
-              << std::endl;
+    state->logger.logf(Logger::INFO, "Switch reader loop exited for host rank %d", host->rank);
 }
 
 int main(int argc, char* argv[]) {
