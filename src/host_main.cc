@@ -241,6 +241,8 @@ static void process_expert_mlp(
         );
     }
 
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
     MsgHeader response{};
     response.magic = MAGIC;
     response.version = PROTOCOL_VERSION;
@@ -327,6 +329,8 @@ static void process_local_attention(
             (token.token_id + i) & 0xFF
         );
     }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     MsgHeader dispatch{};
     dispatch.magic = MAGIC;
