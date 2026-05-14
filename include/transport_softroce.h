@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <chrono>
 
 struct SrConn;
 struct SrListener;
@@ -22,3 +23,12 @@ void sr_close(SrConn* conn);
 void sr_close_listener(SrListener* listener);
 
 uint64_t ns_timestamp();
+
+enum class SrReadStatus { OK, TIMEOUT, FAILED };
+
+SrReadStatus sr_read_for(
+    SrConn* conn,
+    MsgHeader& header,
+    std::vector<char>& payload,
+    std::chrono::milliseconds timeout
+);

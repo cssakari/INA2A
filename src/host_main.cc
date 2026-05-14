@@ -73,12 +73,56 @@ public:
         return true;
     }
 
+    bool try_pop(T& item) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (q_.empty()) {
+            return false;
+        }
+        item = std::move(q_.front());
+        q_.pop_front();
+        return true;
+    }
+
 private:
     std::mutex mu_;
     std::condition_variable cv_;
     std::deque<T> q_;
     bool closed_ = false;
 };
+
+enum class LoopMode {
+    FOUR_LOOPS,
+    IO_COMBINED,
+    ALL_COMBINED
+};
+
+static const char* loop_mode_name(LoopMode mode) {
+    switch (mode) {
+        case LoopMode::FOUR_LOOPS:
+            return "four";
+        case LoopMode::IO_COMBINED:
+            return "io";
+        case LoopMode::ALL_COMBINED:
+            return "all";
+    }
+    return "unknown";
+}
+
+static bool parse_loop_mode(const std::string& s, LoopMode& mode) {
+    if (s == "four" || s == "4") {
+        mode = LoopMode::FOUR_LOOPS;
+        return true;
+    }
+    if (s == "io" || s == "3") {
+        mode = LoopMode::IO_COMBINED;
+        return true;
+    }
+    if (s == "all" || s == "1") {
+        mode = LoopMode::ALL_COMBINED;
+        return true;
+    }
+    return false;
+}
 
 struct OutMsg {
     MsgHeader header{};
@@ -168,6 +212,13 @@ struct HostState {
 
     Logger logger{"host.log"};
 };
+
+static void shutdown_runtime(HostState& state) {
+    state.running.store(false);
+    state.cv.notify_all();
+    state.send_queue.close();
+    state.compute_queue.close();
+}
 
 static void enqueue_send(
     HostState& state,
@@ -385,153 +436,251 @@ static bool send_to_switch(
     return sr_write(state.conn, header, payload);
 }
 
-static void control_loop(HostState* state) {
-    /*
-     * 初始只允许 window_size 个 raw token 进入 attention。
-     */
-    try_admit_raw_tokens_to_compute_queue(*state);
+static bool handle_incoming_message(
+    HostState& state,
+    const MsgHeader& header,
+    std::vector<char>&& payload
+) {
+    int idx = static_cast<int>(header.global_idx);
 
-    while (state->running.load()) {
-        std::vector<int> need_pull;
-        bool window_moved = false;
-        bool should_send_finish = false;
-        MsgHeader finish{};
-
+    if (header.type == MSG_ACK) {
         {
-            std::unique_lock<std::mutex> lock(state->state_mutex);
+            std::lock_guard<std::mutex> lock(state.state_mutex);
+            if (idx >= 0 && idx < static_cast<int>(state.token_states.size())) {
+                state.token_states[idx].dispatch_acked = true;
+            }
+        }
+        state.cv.notify_all();
+        return true;
+    }
 
-            /*
-             * 等 read_loop / compute_loop 通知，或者周期性醒来检查 pull retry。
-             * 这里用 1ms 是简单版本；后面可以改成 wait_until(next_pull_time)。
-             */
-            state->cv.wait_for(lock, std::chrono::milliseconds(1));
+    if (header.type == MSG_EXPERT_INPUT) {
+        ComputeTask task;
+        task.type = ComputeTaskType::EXPERT_MLP;
+        task.header = header;
+        task.payload = std::move(payload);
+        state.compute_queue.push(std::move(task));
+        return true;
+    }
 
-            if (!state->running.load()) {
+    if (header.type == MSG_NOT_READY) {
+        {
+            std::lock_guard<std::mutex> lock(state.state_mutex);
+            if (idx >= 0 && idx < static_cast<int>(state.token_states.size())) {
+                auto& st = state.token_states[idx];
+                st.pull_inflight = false;
+                st.pull_attempts++;
+                st.next_pull_time =
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+            }
+        }
+        state.cv.notify_all();
+        return true;
+    }
+
+    if (header.type == MSG_COMBINE_RESULT) {
+        {
+            std::lock_guard<std::mutex> lock(state.state_mutex);
+            if (idx >= 0 && idx < static_cast<int>(state.token_states.size())) {
+                auto& st = state.token_states[idx];
+                st.combine_done = true;
+                st.pull_inflight = false;
+                st.combine_payload = std::move(payload);
+
+                state.logger.logf(
+                    Logger::INFO,
+                    "Host rank=%d received COMBINE_RESULT token=%lu token_index=%d",
+                    state.rank,
+                    header.token_id,
+                    idx
+                );
+            }
+        }
+        state.cv.notify_all();
+        return true;
+    }
+
+    if (header.type == MSG_FINISH) {
+        state.logger.logf(Logger::INFO, "Host rank=%d received FINISH", state.rank);
+        shutdown_runtime(state);
+        return false;
+    }
+
+    state.logger.logf(
+        Logger::ERROR,
+        "Host rank=%d ignored msg_type=%d",
+        state.rank,
+        header.type
+    );
+
+    return true;
+}
+
+static void control_tick(HostState& state) {
+    std::vector<int> need_pull;
+    bool window_moved = false;
+    bool should_send_finish = false;
+    MsgHeader finish{};
+
+    {
+        std::unique_lock<std::mutex> lock(state.state_mutex);
+
+        if (!state.running.load()) {
+            return;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+
+        for (int i = state.window_base; i < state.next_to_admit; ++i) {
+            if (i < 0 || i >= static_cast<int>(state.token_states.size())) {
+                continue;
+            }
+
+            auto& st = state.token_states[i];
+
+            if (!st.admitted) {
+                continue;
+            }
+            if (!st.attention_done) {
+                continue;
+            }
+            if (!st.dispatch_acked) {
+                continue;
+            }
+            if (st.combine_done) {
+                continue;
+            }
+            if (st.pull_inflight) {
+                continue;
+            }
+            if (now < st.next_pull_time) {
+                continue;
+            }
+
+            st.pull_inflight = true;
+            need_pull.push_back(i);
+        }
+
+        while (state.window_base < state.num_tokens) {
+            int idx = state.window_base;
+
+            if (idx < 0 || idx >= static_cast<int>(state.token_states.size())) {
                 break;
             }
 
-            auto now = std::chrono::steady_clock::now();
-
-            /*
-             * 1. 对已经 dispatch ACK，但尚未 combine 完成的 token，周期性发 pull。
-             */
-            for (int i = state->window_base;
-                 i < state->next_to_admit;
-                 ++i) {
-                if (i < 0 ||
-                    i >= static_cast<int>(state->token_states.size())) {
-                    continue;
-                }
-
-                auto& st = state->token_states[i];
-
-                if (!st.admitted) {
-                    continue;
-                }
-
-                if (!st.attention_done) {
-                    continue;
-                }
-
-                if (!st.dispatch_acked) {
-                    continue;
-                }
-
-                if (st.combine_done) {
-                    continue;
-                }
-
-                if (st.pull_inflight) {
-                    continue;
-                }
-
-                if (now < st.next_pull_time) {
-                    continue;
-                }
-
-                st.pull_inflight = true;
-                need_pull.push_back(i);
+            if (!state.token_states[idx].combine_done) {
+                break;
             }
 
-            /*
-             * 2. 滑动窗口。
-             */
-            while (state->window_base < state->num_tokens) {
-                int idx = state->window_base;
+            state.logger.logf(
+                Logger::INFO,
+                "Host rank=%d sliding window releases token_index=%d",
+                state.rank,
+                idx
+            );
 
-                if (idx < 0 ||
-                    idx >= static_cast<int>(state->token_states.size())) {
-                    break;
-                }
-
-                if (!state->token_states[idx].combine_done) {
-                    break;
-                }
-
-                state->logger.logf(
-                    Logger::INFO,
-                    "Host rank=%d sliding window releases token_index=%d",
-                    state->rank,
-                    idx
-                );
-
-                state->window_base++;
-                state->received_combines++;
-                window_moved = true;
-            }
-
-            /*
-             * 3. 判断本 host 的 sender 侧是否完成。
-             * 注意：这里只构造 FINISH，不要持锁 enqueue_send。
-             */
-            if (!state->finish_enqueued &&
-                state->received_combines >= state->num_tokens) {
-                finish.magic = MAGIC;
-                finish.version = PROTOCOL_VERSION;
-                finish.type = MSG_FINISH;
-                finish.header_len = sizeof(MsgHeader);
-                finish.payload_len = 0;
-
-                finish.run_id = state->workload.empty()
-                                    ? 0
-                                    : state->workload[0].run_id;
-                finish.src_rank = static_cast<uint32_t>(state->rank);
-                finish.dst_rank = 0;
-                finish.origin_rank = static_cast<uint32_t>(state->rank);
-                finish.timestamp_ns = ns_timestamp();
-
-                state->finish_enqueued = true;
-                should_send_finish = true;
-
-                state->logger.logf(
-                    Logger::INFO,
-                    "Host rank=%d local sender finished all tokens",
-                    state->rank
-                );
-            }
+            state.window_base++;
+            state.received_combines++;
+            window_moved = true;
         }
 
-        /*
-         * 4. 发送 pull。
-         * 不要在 state_mutex 里 enqueue_send，避免锁链路变长。
-         */
-        for (int idx : need_pull) {
-            enqueue_combine_pull(*state, idx);
+        if (!state.finish_enqueued && state.received_combines >= state.num_tokens) {
+            finish.magic = MAGIC;
+            finish.version = PROTOCOL_VERSION;
+            finish.type = MSG_FINISH;
+            finish.header_len = sizeof(MsgHeader);
+            finish.payload_len = 0;
+            finish.run_id = state.workload.empty() ? 0 : state.workload[0].run_id;
+            finish.src_rank = static_cast<uint32_t>(state.rank);
+            finish.dst_rank = 0;
+            finish.origin_rank = static_cast<uint32_t>(state.rank);
+            finish.timestamp_ns = ns_timestamp();
+
+            state.finish_enqueued = true;
+            should_send_finish = true;
+
+            state.logger.logf(
+                Logger::INFO,
+                "Host rank=%d local sender finished all tokens",
+                state.rank
+            );
+        }
+    }
+
+    for (int idx : need_pull) {
+        enqueue_combine_pull(state, idx);
+    }
+
+    if (window_moved) {
+        try_admit_raw_tokens_to_compute_queue(state);
+    }
+
+    if (should_send_finish) {
+        enqueue_send(state, finish, nullptr);
+    }
+}
+
+static bool process_compute_task(HostState& state, ComputeTask& task) {
+    if (!state.running.load()) {
+        return false;
+    }
+
+    if (task.type == ComputeTaskType::LOCAL_ATTENTION) {
+        process_local_attention(state, task.token_index);
+    } else if (task.type == ComputeTaskType::EXPERT_MLP) {
+        process_expert_mlp(state, task.header, task.payload);
+    }
+
+    return state.running.load();
+}
+
+static bool process_out_msg(HostState& state, OutMsg& msg) {
+    const void* payload_ptr = nullptr;
+
+    if (!msg.payload.empty()) {
+        payload_ptr = msg.payload.data();
+    }
+
+    if (!send_to_switch(state, msg.header, payload_ptr)) {
+        state.logger.logf(
+            Logger::ERROR,
+            "Host rank=%d send failed, msg_type=%d token=%lu",
+            state.rank,
+            msg.header.type,
+            msg.header.token_id
+        );
+
+        shutdown_runtime(state);
+        return false;
+    }
+
+    return true;
+}
+
+static void drain_send_queue(HostState& state, int max_items) {
+    for (int i = 0; i < max_items && state.running.load(); ++i) {
+        OutMsg msg;
+
+        if (!state.send_queue.try_pop(msg)) {
+            break;
         }
 
-        /*
-         * 5. 窗口释放后 admit 新 token。
-         */
-        if (window_moved) {
-            try_admit_raw_tokens_to_compute_queue(*state);
+        if (!process_out_msg(state, msg)) {
+            break;
+        }
+    }
+}
+
+static void control_loop(HostState* state) {
+    try_admit_raw_tokens_to_compute_queue(*state);
+
+    while (state->running.load()) {
+        {
+            std::unique_lock<std::mutex> lock(state->state_mutex);
+            state->cv.wait_for(lock, std::chrono::milliseconds(1));
         }
 
-        /*
-         * 6. 发送 FINISH。
-         */
-        if (should_send_finish) {
-            enqueue_send(*state, finish, nullptr);
-        }
+        control_tick(*state);
     }
 
     state->logger.logf(
@@ -549,14 +698,8 @@ static void compute_loop(HostState* state) {
             break;
         }
 
-        if (!state->running.load()) {
+        if (!process_compute_task(*state, task)) {
             break;
-        }
-
-        if (task.type == ComputeTaskType::LOCAL_ATTENTION) {
-            process_local_attention(*state, task.token_index);
-        } else if (task.type == ComputeTaskType::EXPERT_MLP) {
-            process_expert_mlp(*state, task.header, task.payload);
         }
     }
 
@@ -575,25 +718,16 @@ static void send_loop(HostState* state) {
             break;
         }
 
-        const void* payload_ptr = nullptr;
-
-        if (!msg.payload.empty()) {
-            payload_ptr = msg.payload.data();
-        }
-
-        if (!send_to_switch(*state, msg.header, payload_ptr)) {
-
-            state->logger.logf(Logger::ERROR, "Host rank=%d send_loop failed, msg_type=%d token=%lu", state->rank, msg.header.type, msg.header.token_id);
-
-            state->running.store(false);
-            state->cv.notify_all();
-            state->send_queue.close();
-            state->compute_queue.close();
+        if (!process_out_msg(*state, msg)) {
             break;
         }
     }
 
-    state->logger.logf(Logger::INFO, "Host rank=%d send_loop exited", state->rank);
+    state->logger.logf(
+        Logger::INFO,
+        "Host rank=%d send_loop exited",
+        state->rank
+    );
 }
 
 static void read_loop(HostState* state) {
@@ -602,109 +736,108 @@ static void read_loop(HostState* state) {
         std::vector<char> payload;
 
         if (!sr_read(state->conn, header, payload)) {
-            
             state->logger.logf(Logger::ERROR, "Host rank=%d read_loop failed", state->rank);
-
-            state->running.store(false);
-            state->cv.notify_all();
-            state->send_queue.close();
-            state->compute_queue.close();
+            shutdown_runtime(*state);
             break;
         }
 
-        int idx = static_cast<int>(header.global_idx);
-
-        if (header.type == MSG_ACK) {
-            {
-                std::lock_guard<std::mutex> lock(state->state_mutex);
-
-                if (idx >= 0 &&
-                    idx < static_cast<int>(state->token_states.size())) {
-                    state->token_states[idx].dispatch_acked = true;
-                }
-            }
-
-            state->cv.notify_all();
-            continue;
-        }
-
-        if (header.type == MSG_EXPERT_INPUT) {
-            ComputeTask task;
-            task.type = ComputeTaskType::EXPERT_MLP;
-            task.header = header;
-            task.payload = std::move(payload);
-
-            state->compute_queue.push(std::move(task));
-            continue;
-        }
-
-        if (header.type == MSG_NOT_READY) {
-            {
-                std::lock_guard<std::mutex> lock(state->state_mutex);
-
-                if (idx >= 0 &&
-                    idx < static_cast<int>(state->token_states.size())) {
-                    auto& st = state->token_states[idx];
-
-                    st.pull_inflight = false;
-                    st.pull_attempts++;
-
-                    st.next_pull_time =
-                        std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(10);
-                }
-            }
-
-            state->cv.notify_all();
-            continue;
-        }
-
-        if (header.type == MSG_COMBINE_RESULT) {
-            {
-                std::lock_guard<std::mutex> lock(state->state_mutex);
-
-                if (idx >= 0 &&
-                    idx < static_cast<int>(state->token_states.size())) {
-                    auto& st = state->token_states[idx];
-
-                    st.combine_done = true;
-                    st.pull_inflight = false;
-                    st.combine_payload = std::move(payload);
-
-                    state->logger.logf(Logger::INFO, "Host rank=%d received COMBINE_RESULT token=%lu token_index=%d", state->rank, header.token_id, idx);
-                }
-            }
-
-            state->cv.notify_all();
-            continue;
-        }
-
-        if (header.type == MSG_FINISH) {
-
-            state->logger.logf(Logger::INFO, "Host rank=%d received FINISH", state->rank);
-
-            state->running.store(false);
-            state->cv.notify_all();
-            state->send_queue.close();
-            state->compute_queue.close();
+        if (!handle_incoming_message(*state, header, std::move(payload))) {
             break;
         }
-
-        state->logger.logf(Logger::ERROR, "Host rank=%d ignored msg_type=%d", state->rank, header.type);
     }
+
+    state->logger.logf(
+        Logger::INFO,
+        "Host rank=%d read_loop exited",
+        state->rank
+    );
 }
 
-enum class PullResult {
-    READY,
-    NOT_READY,
-    STOPPED
-};
+static void io_combined_loop(HostState* state) {
+    while (state->running.load()) {
+        drain_send_queue(*state, 64);
+
+        MsgHeader header{};
+        std::vector<char> payload;
+
+        SrReadStatus rs = sr_read_for(
+            state->conn,
+            header,
+            payload,
+            std::chrono::milliseconds(1)
+        );
+
+        if (rs == SrReadStatus::OK) {
+            if (!handle_incoming_message(*state, header, std::move(payload))) {
+                break;
+            }
+        } else if (rs == SrReadStatus::TIMEOUT) {
+            continue;
+        } else {
+            state->logger.logf(Logger::ERROR, "Host rank=%d io_combined_loop read failed", state->rank);
+            shutdown_runtime(*state);
+            break;
+        }
+    }
+
+    state->logger.logf(
+        Logger::INFO,
+        "Host rank=%d io_combined_loop exited",
+        state->rank
+    );
+}
+
+static void all_combined_loop(HostState* state) {
+    try_admit_raw_tokens_to_compute_queue(*state);
+
+    while (state->running.load()) {
+        control_tick(*state);
+
+        ComputeTask task;
+        if (state->compute_queue.try_pop(task)) {
+            process_compute_task(*state, task);
+        }
+
+        drain_send_queue(*state, 64);
+
+        MsgHeader header{};
+        std::vector<char> payload;
+
+        SrReadStatus rs = sr_read_for(
+            state->conn,
+            header,
+            payload,
+            std::chrono::milliseconds(1)
+        );
+
+        if (rs == SrReadStatus::OK) {
+            if (!handle_incoming_message(*state, header, std::move(payload))) {
+                break;
+            }
+        } else if (rs == SrReadStatus::TIMEOUT) {
+            continue;
+        } else {
+            state->logger.logf(Logger::ERROR, "Host rank=%d all_combined_loop read failed", state->rank);
+            shutdown_runtime(*state);
+            break;
+        }
+    }
+
+    shutdown_runtime(*state);
+
+    state->logger.logf(
+        Logger::INFO,
+        "Host rank=%d all_combined_loop exited",
+        state->rank
+    );
+}
 
 int main(int argc, char* argv[]) {
     if (argc < 7) {
-        std::cerr << "Usage: "
-                  << argv[0]
-                  << " <switch_ip> <switch_port> <rank> <num_tokens> <num_hosts> <topk> <window_size>\n";
+        std::cerr
+            << "Usage: " << argv[0]
+            << " <switch_ip> <switch_port> <rank> <num_tokens> <num_hosts> <topk> [window_size] [loop_mode]\n"
+            << "loop_mode: four | io | all\n";
         return 1;
     }
 
@@ -715,6 +848,19 @@ int main(int argc, char* argv[]) {
     int num_hosts = std::stoi(argv[5]);
     int topk = argc > 6 ? std::stoi(argv[6]) : std::min(2, num_hosts);
     int window_size = argc > 7 ? std::stoi(argv[7]) : 1;
+
+    LoopMode loop_mode = LoopMode::FOUR_LOOPS;
+
+    if (argc > 8) {
+        if (!parse_loop_mode(argv[8], loop_mode)) {
+            std::cerr << "invalid loop_mode, expected: four | io | all" << std::endl;
+            return 7;
+        }
+    }
+
+    std::cout << "Host rank=" << rank
+          << " using loop_mode=" << loop_mode_name(loop_mode)
+          << std::endl;
 
     if (rank < 0 || rank >= num_hosts) {
         std::cerr << "rank must be between 0 and num_hosts - 1"
@@ -771,10 +917,6 @@ int main(int argc, char* argv[]) {
         return 5;
     }
 
-    /*
-     * HELLO ACK 由主线程同步读取。
-     * 之后整个程序只能由 reader_loop 调用 sr_read()。
-     */
     MsgHeader hello_reply{};
     std::vector<char> hello_payload;
 
@@ -819,30 +961,49 @@ int main(int argc, char* argv[]) {
         state.token_states.resize(state.num_tokens);
     }
 
-    std::thread sender_thread(send_loop, &state);
-    std::thread reader_thread(read_loop, &state);
-    std::thread compute_thread(compute_loop, &state);
-    std::thread control_thread(control_loop, &state);
+    if (loop_mode == LoopMode::FOUR_LOOPS) {
+        std::thread sender_thread(send_loop, &state);
+        std::thread reader_thread(read_loop, &state);
+        std::thread compute_thread(compute_loop, &state);
+        std::thread control_thread(control_loop, &state);
 
-    if (control_thread.joinable()) {
-        control_thread.join();
-    }
+        if (control_thread.joinable()) {
+            control_thread.join();
+        }
 
-    if (compute_thread.joinable()) {
-        compute_thread.join();
-    }
+        if (compute_thread.joinable()) {
+            compute_thread.join();
+        }
 
-    state.running.store(false);
-    state.cv.notify_all();
-    state.send_queue.close();
-    state.compute_queue.close();
+        shutdown_runtime(state);
 
-    if (reader_thread.joinable()) {
-        reader_thread.join();
-    }
+        if (reader_thread.joinable()) {
+            reader_thread.join();
+        }
 
-    if (sender_thread.joinable()) {
-        sender_thread.join();
+        if (sender_thread.joinable()) {
+            sender_thread.join();
+        }
+    } else if (loop_mode == LoopMode::IO_COMBINED) {
+        std::thread io_thread(io_combined_loop, &state);
+        std::thread compute_thread(compute_loop, &state);
+        std::thread control_thread(control_loop, &state);
+
+        if (control_thread.joinable()) {
+            control_thread.join();
+        }
+
+        if (compute_thread.joinable()) {
+            compute_thread.join();
+        }
+    
+        shutdown_runtime(state);
+
+        if (io_thread.joinable()) {
+            io_thread.join();
+        }
+    } else {
+        all_combined_loop(&state);
     }
 
     sr_close(state.conn);

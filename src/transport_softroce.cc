@@ -583,3 +583,100 @@ uint64_t ns_timestamp() {
         ).count()
     );
 }
+
+SrReadStatus sr_read_for(
+    SrConn* conn,
+    MsgHeader& header,
+    std::vector<char>& payload,
+    std::chrono::milliseconds timeout
+) {
+    payload.clear();
+
+    if (!conn || !conn->recv_buf || !conn->recv_mr || !conn->recv_cq) {
+        return SrReadStatus::FAILED;
+    }
+
+    // 确保有 recv 已经 post
+    if (!conn->recv_posted) {
+        if (!post_recv(conn)) {
+            return SrReadStatus::FAILED;
+        }
+    }
+
+    auto start = std::chrono::steady_clock::now();
+    uint32_t byte_len = 0;
+
+    while (true) {
+        // 非阻塞轮询 CQ
+        ibv_wc wc{};
+        int n = ibv_poll_cq(conn->recv_cq, 1, &wc);
+
+        if (n < 0) {
+            std::cerr << "ibv_poll_cq failed" << std::endl;
+            return SrReadStatus::FAILED;
+        }
+
+        if (n == 1) {
+            // 有完成项
+            if (wc.status != IBV_WC_SUCCESS) {
+                std::cerr << "RDMA work completion failed: "
+                          << ibv_wc_status_str(wc.status) << std::endl;
+                return SrReadStatus::FAILED;
+            }
+
+            if (wc.opcode != IBV_WC_RECV) {
+                std::cerr << "Unexpected WC opcode: " << wc.opcode << std::endl;
+                return SrReadStatus::FAILED;
+            }
+
+            byte_len = wc.byte_len;
+            conn->recv_posted = false;
+
+            if (byte_len < sizeof(MsgHeader)) {
+                std::cerr << "Received message too small: " << byte_len << std::endl;
+                return SrReadStatus::FAILED;
+            }
+
+            MsgHeader wire{};
+            std::memcpy(&wire, conn->recv_buf, sizeof(MsgHeader));
+            header = header_from_wire(wire);
+
+            if (header.magic != MAGIC || header.version != PROTOCOL_VERSION) {
+                std::cerr << "Invalid protocol header" << std::endl;
+                return SrReadStatus::FAILED;
+            }
+
+            size_t expected_len = sizeof(MsgHeader) + static_cast<size_t>(header.payload_len);
+            if (expected_len > byte_len) {
+                std::cerr << "Truncated RDMA message: expected "
+                          << expected_len << ", got " << byte_len << std::endl;
+                return SrReadStatus::FAILED;
+            }
+
+            if (header.payload_len > 0) {
+                const char* begin = conn->recv_buf + sizeof(MsgHeader);
+                const char* end = begin + header.payload_len;
+                payload.assign(begin, end);
+            }
+
+            // 为下一条消息提前 post recv
+            if (!post_recv(conn)) {
+                std::cerr << "Failed to post next recv buffer" << std::endl;
+                return SrReadStatus::FAILED;
+            }
+
+            return SrReadStatus::OK;
+        }
+
+        // 超时判断
+        auto now = std::chrono::steady_clock::now();
+        if (now - start >= timeout) {
+            return SrReadStatus::TIMEOUT;
+        }
+
+        // CPU-friendly 轮询
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+
+    return SrReadStatus::FAILED; // 理论上不会到这里
+}
